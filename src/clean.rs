@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,8 +37,6 @@ pub struct Candidate {
     pub blocked: Option<String>,
     /// Project artifact touched in the last week, so probably part of active work.
     pub recent: bool,
-    /// Inside a git work tree, so removal must first prove git tracks nothing in it.
-    in_repo: bool,
     project: bool,
     id: (u64, u64),
 }
@@ -131,20 +130,29 @@ const RULES: &[Rule] = &[
 pub fn find(root: &Path, progress: &AtomicU64) -> Vec<Candidate> {
     let mut out = Vec::new();
     let home = env_dir("HOME");
+    let mounts = mount_points();
     if let Ok(meta) = fs::symlink_metadata(root) {
-        let in_repo = root.ancestors().any(|a| a.join(".git").exists());
         walk(
             root,
             meta.dev(),
-            in_repo,
             home.as_deref(),
+            mounts.as_deref(),
             &mut out,
             progress,
         );
     }
     for (kind, path, risk, regen, action) in home.map(|h| known_caches(&h)).unwrap_or_default() {
         if path.starts_with(root)
-            && let Some(c) = candidate(kind, &path, risk, regen, action, false, false, progress)
+            && let Some(c) = candidate(
+                kind,
+                &path,
+                risk,
+                regen,
+                action,
+                false,
+                mounts.as_deref(),
+                progress,
+            )
         {
             out.push(c);
         }
@@ -158,8 +166,8 @@ pub fn find(root: &Path, progress: &AtomicU64) -> Vec<Candidate> {
 fn walk(
     dir: &Path,
     dev: u64,
-    in_repo: bool,
     home: Option<&Path>,
+    mounts: Option<&[PathBuf]>,
     out: &mut Vec<Candidate>,
     progress: &AtomicU64,
 ) {
@@ -171,7 +179,6 @@ fn walk(
     if has("pyvenv.cfg") {
         return; // Inside an unmatched virtualenv: its __pycache__ dirs belong to installed packages.
     }
-    let in_repo = in_repo || has(".git");
     for e in &entries {
         progress.fetch_add(1, Ordering::Relaxed);
         let Ok(meta) = e.metadata() else { continue };
@@ -191,7 +198,7 @@ fn walk(
                 rule.regen,
                 Action::Remove,
                 true,
-                in_repo,
+                mounts,
                 progress,
             ) {
                 out.push(c);
@@ -200,7 +207,7 @@ fn walk(
         }
         let app_data = name.starts_with('.') && home == Some(dir);
         if !app_data && name != ".git" && name != "node_modules" {
-            walk(&e.path(), dev, in_repo, home, out, progress);
+            walk(&e.path(), dev, home, mounts, out, progress);
         }
     }
 }
@@ -304,7 +311,7 @@ fn candidate(
     regen: &'static str,
     action: Action,
     project: bool,
-    in_repo: bool,
+    mounts: Option<&[PathBuf]>,
     progress: &AtomicU64,
 ) -> Option<Candidate> {
     let meta = fs::symlink_metadata(path).ok()?;
@@ -315,11 +322,7 @@ fn candidate(
     if m.size == 0 {
         return None;
     }
-    let blocked = if meta.uid() != unsafe { libc::getuid() } {
-        Some("owned by another user".into())
-    } else {
-        unsafe_reason(path, &m, project, in_repo).map(String::from)
-    };
+    let blocked = unsafe_reason(path, &m, project, mounts).map(String::from);
     let recent = project && m.newest.elapsed().is_ok_and(|age| age < RECENT);
     Some(Candidate {
         kind,
@@ -331,7 +334,6 @@ fn candidate(
         action,
         blocked,
         recent,
-        in_repo,
         project,
         id: (meta.dev(), meta.ino()),
     })
@@ -344,6 +346,10 @@ struct Measure {
     git: bool,
     /// Another filesystem is mounted inside; `remove_dir_all` would descend into it.
     mount: bool,
+    /// A directory or entry could not be read, so the size and every check below are incomplete.
+    unreadable: bool,
+    /// The candidate or something inside it belongs to another user.
+    foreign: bool,
 }
 
 /// Allocated bytes like `du -x`, counting a hard-linked file only when all its links are inside `path`,
@@ -351,17 +357,28 @@ struct Measure {
 fn measure(path: &Path, dev: u64, progress: &AtomicU64) -> Measure {
     let mut links: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
     let mut stack = vec![path.to_path_buf()];
+    let uid = unsafe { libc::getuid() };
     let mut m = Measure {
         size: 0,
         newest: SystemTime::UNIX_EPOCH,
         git: false,
         mount: false,
+        unreadable: false,
+        foreign: false,
     };
     while let Some(dir) = stack.pop() {
-        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            m.unreadable = true;
+            continue;
+        };
+        for e in entries {
             progress.fetch_add(1, Ordering::Relaxed);
-            let Ok(meta) = e.metadata() else { continue };
+            let Ok((e, meta)) = e.and_then(|e| e.metadata().map(|meta| (e, meta))) else {
+                m.unreadable = true;
+                continue;
+            };
             m.git |= e.file_name() == ".git";
+            m.foreign |= meta.uid() != uid;
             if meta.is_dir() {
                 if meta.dev() != dev {
                     m.mount = true;
@@ -381,25 +398,58 @@ fn measure(path: &Path, dev: u64, progress: &AtomicU64) -> Measure {
             m.size += meta.blocks() * 512;
         }
     }
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        m.size += meta.blocks() * 512;
-        m.newest = m.newest.max(meta.modified().unwrap_or(m.newest));
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            m.size += meta.blocks() * 512;
+            m.newest = m.newest.max(meta.modified().unwrap_or(m.newest));
+            m.foreign |= meta.uid() != uid;
+        }
+        Err(_) => m.unreadable = true,
     }
     m
 }
 
-/// Checks shared by the scan and the re-check right before removal.
-fn unsafe_reason(path: &Path, m: &Measure, project: bool, in_repo: bool) -> Option<&'static str> {
-    if m.mount {
+/// Every mount point, bind mounts included: those share the device number, so `measure`'s dev check misses them.
+/// `None` when the table cannot be read, which blocks every candidate instead of passing them all.
+fn mount_points() -> Option<Vec<PathBuf>> {
+    let info = fs::read("/proc/self/mountinfo").ok()?;
+    let points = info
+        .split(|&b| b == b'\n')
+        .filter_map(|l| l.split(|&b| b == b' ').nth(4))
+        .map(|p| PathBuf::from(std::ffi::OsString::from_vec(crate::disks::unescape(p))))
+        .collect();
+    Some(points)
+}
+
+/// Checks shared by the scan and the re-check right before acting. Anything it could not verify blocks.
+fn unsafe_reason(
+    path: &Path,
+    m: &Measure,
+    project: bool,
+    mounts: Option<&[PathBuf]>,
+) -> Option<&'static str> {
+    let Some(mounts) = mounts else {
+        return Some("could not read the mount table");
+    };
+    if m.mount || mounts.iter().any(|p| p.starts_with(path)) {
         Some("contains a mount point")
+    } else if m.unreadable {
+        Some("could not read everything inside")
+    } else if m.foreign {
+        Some("holds files of another user")
     } else if m.git && project {
         // Tool caches (uv, cargo) legitimately hold git checkouts; only project artifacts may not hide a repo.
         Some("contains a git repository")
-    } else if in_repo && !git_tracks_nothing(path) {
+    } else if in_repo(path) && !git_tracks_nothing(path) {
         Some("git-tracked files, or git could not tell")
     } else {
         None
     }
+}
+
+/// Looked up again at every check, so a `git init` above the candidate after the scan is noticed.
+fn in_repo(path: &Path) -> bool {
+    path.ancestors().any(|a| a.join(".git").exists())
 }
 
 fn on_path(bin: &str) -> bool {
@@ -419,7 +469,22 @@ fn git_tracks_nothing(dir: &Path) -> bool {
 
 /// Re-checks the path right before acting, so a directory swapped for a symlink or a new checkout since the scan is refused.
 pub fn execute(c: &Candidate, permanent: bool) -> Result<(), String> {
+    let mounts = mount_points();
     if let Action::Run(cmd) = c.action {
+        // The tool deletes inside this directory too, so it gets the same checks; a cache already gone needs none.
+        match fs::symlink_metadata(&c.path) {
+            Ok(meta) => {
+                if !meta.is_dir() || (meta.dev(), meta.ino()) != c.id {
+                    return Err("changed since scan; rescan first".into());
+                }
+                let m = measure(&c.path, meta.dev(), &AtomicU64::new(0));
+                if let Some(why) = unsafe_reason(&c.path, &m, c.project, mounts.as_deref()) {
+                    return Err(why.into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
         let out = Command::new(cmd[0])
             .args(&cmd[1..])
             .output()
@@ -434,11 +499,8 @@ pub fn execute(c: &Candidate, permanent: bool) -> Result<(), String> {
     if !meta.is_dir() || (meta.dev(), meta.ino()) != c.id {
         return Err("changed since scan; rescan first".into());
     }
-    if meta.uid() != unsafe { libc::getuid() } {
-        return Err("owned by another user".into());
-    }
     let m = measure(&c.path, meta.dev(), &AtomicU64::new(0));
-    if let Some(why) = unsafe_reason(&c.path, &m, c.project, c.in_repo) {
+    if let Some(why) = unsafe_reason(&c.path, &m, c.project, mounts.as_deref()) {
         return Err(why.into());
     }
     if permanent {
@@ -460,6 +522,7 @@ pub fn execute(c: &Candidate, permanent: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn detects_only_marked_artifacts_and_refuses_swapped_paths() {
@@ -539,6 +602,92 @@ mod tests {
         std::os::unix::fs::symlink(root.join("lone"), &target.path).unwrap();
         assert!(execute(target, true).is_err());
         assert!(root.join("lone/target/x").exists());
+
+        // A `git init` above the candidate after the scan, with a tracked file inside: refused at execute time.
+        let js = found
+            .iter()
+            .find(|c| c.path.ends_with("js/node_modules"))
+            .unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(root.join("js"))
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                ok.status.success(),
+                "{}",
+                String::from_utf8_lossy(&ok.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-f", "node_modules/a/node_modules/b/i.js"]);
+        assert_eq!(
+            execute(js, true).unwrap_err(),
+            "git-tracked files, or git could not tell"
+        );
+        assert!(js.path.exists());
+
+        // The owning tool's command gets the same checks: an unreadable dir inside blocks it.
+        let unreadable = root.join("cache/locked");
+        fs::create_dir_all(&unreadable).unwrap();
+        fs::write(root.join("cache/x"), "x").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut tool = candidate(
+            "tool",
+            &root.join("cache"),
+            Risk::Slow,
+            "",
+            Action::Run(&["true"]),
+            false,
+            Some(&[]),
+            &AtomicU64::new(0),
+        )
+        .unwrap();
+        if unsafe { libc::getuid() } != 0 {
+            assert_eq!(
+                tool.blocked.as_deref(),
+                Some("could not read everything inside")
+            );
+            tool.blocked = None;
+            assert_eq!(
+                execute(&tool, true).unwrap_err(),
+                "could not read everything inside"
+            );
+        }
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A tool cache swapped for another directory since the scan: the command must not run.
+        tool.blocked = None;
+        fs::rename(root.join("cache"), root.join("cache-old")).unwrap();
+        fs::create_dir(root.join("cache")).unwrap();
+        assert_eq!(
+            execute(&tool, true).unwrap_err(),
+            "changed since scan; rescan first"
+        );
+        fs::remove_dir(root.join("cache")).unwrap();
+        fs::rename(root.join("cache-old"), root.join("cache")).unwrap();
+
+        // Bind mounts keep the device number, so they are caught through the mount table.
+        let m = measure(
+            &root.join("cache"),
+            fs::metadata(&root).unwrap().dev(),
+            &AtomicU64::new(0),
+        );
+        assert_eq!(
+            unsafe_reason(
+                &root.join("cache"),
+                &m,
+                false,
+                Some(&[root.join("cache/locked")])
+            ),
+            Some("contains a mount point")
+        );
+        assert_eq!(
+            unsafe_reason(&root.join("cache"), &m, false, None),
+            Some("could not read the mount table")
+        );
 
         let pyc = found.iter().find(|c| c.kind == "Python bytecode").unwrap();
         execute(pyc, true).unwrap();
