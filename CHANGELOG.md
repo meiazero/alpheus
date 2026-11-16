@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.1](https://github.com/meiazero/alpheus/compare/v0.1.0...v0.1.1) (2026-11-16)
+
+
+### Fixed
+
+* **clean:** block candidates whose contents could not be verified ([a92ab5a](https://github.com/meiazero/alpheus/commit/a92ab5a4c0961bfe360a6d79e9df25e76e7ee6e2))
+* **clean:** never offer a candidate whose contents could not be verified ([3967a93](https://github.com/meiazero/alpheus/commit/3967a93fc0e44d21ea8ac82cdbea76341f0eff7f))
+* **tui:** keep bar colors on the selected row and hide entries you cannot remove ([2107691](https://github.com/meiazero/alpheus/commit/2107691c68eedb68aa0dda8d14146185d81abe2a))
+* **tui:** keep usage bars visible on the selected row and hide entries you cannot remove ([5dbb38d](https://github.com/meiazero/alpheus/commit/5dbb38dadb61df3ad01bcef4793f40fe88a84ea5))
+
 ## 0.1.0 (2026-11-16)
 
 
