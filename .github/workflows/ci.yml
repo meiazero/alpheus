@@ -21,8 +21,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      # `curl | sh` users run install.sh unread; bashka exits non-zero on anything short of green.
+      # The release asset is pinned by sha256 (GitHub release digest).
+      - name: Check install.sh with bashka
+        env:
+          BASHKA_URL: https://github.com/dmtrKovalenko/bashka/releases/download/v0.12.0/bashka-x86_64-unknown-linux-musl
+          BASHKA_SHA256: 64263abb2ebfc88c2b56b2fea4744ac1e7553681cf320c2efa593f2c1b62a1e6
+        run: |
+          curl --proto '=https' --tlsv1.2 -fLsS "$BASHKA_URL" -o "$RUNNER_TEMP/bashka"
+          echo "$BASHKA_SHA256  $RUNNER_TEMP/bashka" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bashka"
+          "$RUNNER_TEMP/bashka" --check --non-interactive < install.sh
+      # rustup on the runner reads rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
