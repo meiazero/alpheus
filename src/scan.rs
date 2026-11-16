@@ -58,7 +58,8 @@ fn walk(
             node.size += child.size;
             node.children.push(child);
         }
-        node.children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+        node.children
+            .sort_unstable_by_key(|c| std::cmp::Reverse(c.size));
     }
     node
 }

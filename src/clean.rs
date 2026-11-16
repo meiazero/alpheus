@@ -149,7 +149,7 @@ pub fn find(root: &Path, progress: &AtomicU64) -> Vec<Candidate> {
             out.push(c);
         }
     }
-    out.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+    out.sort_unstable_by_key(|c| std::cmp::Reverse(c.size));
     out
 }
 
