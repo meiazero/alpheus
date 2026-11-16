@@ -34,7 +34,7 @@ pub fn list() -> Vec<Disk> {
             continue;
         }
         seen.push(dev);
-        let mount = unescape(mount);
+        let mount = String::from_utf8_lossy(&unescape(mount.as_bytes())).into_owned();
         if let Some(disk) = stat(&mount, fstype) {
             disks.push(disk);
         }
@@ -61,8 +61,8 @@ pub fn stat(mount: &str, fstype: &str) -> Option<Disk> {
 }
 
 /// `/proc/mounts` writes space, tab, newline and backslash as 3-digit octal escapes (`\040`).
-fn unescape(s: &str) -> String {
-    let b = s.as_bytes();
+/// Works on bytes: mount points need not be UTF-8.
+pub fn unescape(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -80,7 +80,7 @@ fn unescape(s: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 pub fn human(bytes: u64) -> String {
@@ -104,9 +104,10 @@ mod tests {
 
     #[test]
     fn unescapes_mount_paths() {
-        assert_eq!(unescape(r"/media/my\040disk"), "/media/my disk");
-        assert_eq!(unescape(r"/a\134b"), r"/a\b");
-        assert_eq!(unescape("/plain"), "/plain");
+        assert_eq!(unescape(br"/media/my\040disk"), b"/media/my disk");
+        assert_eq!(unescape(br"/a\134b"), br"/a\b");
+        assert_eq!(unescape(br"/bad\377"), b"/bad\xff");
+        assert_eq!(unescape(b"/plain"), b"/plain");
     }
 
     #[test]
