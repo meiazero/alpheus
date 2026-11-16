@@ -22,9 +22,15 @@ License: [MIT](LICENSE).
 
 ## Install
 
+On Linux x86_64, this installs the latest release to `~/.local/bin` after checking it against the
+release's `sha256.sum`:
+
 ```bash
-cargo install --git https://github.com/meiazero/alpheus
+curl -fsSL https://raw.githubusercontent.com/meiazero/alpheus/main/install.sh | sh
 ```
+
+`ALPHEUS_VERSION=v0.1.0` pins a release and `ALPHEUS_INSTALL_DIR` changes the target directory.
+From source: `cargo install --git https://github.com/meiazero/alpheus`.
 
 ## Quick start
 
@@ -59,4 +65,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- CI runs the same three commands on every push and pull request.
+- `rust-toolchain.toml` pins the toolchain; rustup installs it on the first `cargo` call.
+- CI runs the commands above, a release build, and `bashka --check` on `install.sh`.
+- Releases: merging the release-please PR tags the version, and `release.yml` builds the static
+  musl binary with cargo-dist, attests it, and publishes it with `sha256.sum`.
