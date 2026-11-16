@@ -379,8 +379,8 @@ impl App {
                 ];
                 let table = Table::new(rows, widths)
                     .column_spacing(2)
-                    .block(Block::bordered().title(" Disks ").fg(Color::Blue))
-                    .row_highlight_style(Style::new().reversed());
+                    .block(frame(" Disks "))
+                    .row_highlight_style(SELECTED);
                 f.render_stateful_widget(table, main, &mut self.table);
             }
             Screen::Scanning {
@@ -398,12 +398,7 @@ impl App {
                 let [mid] = Layout::vertical([Constraint::Length(3)])
                     .flex(layout::Flex::Center)
                     .areas(main);
-                f.render_widget(
-                    Paragraph::new(text)
-                        .centered()
-                        .block(Block::bordered().fg(Color::Blue)),
-                    mid,
-                );
+                f.render_widget(Paragraph::new(text).centered().block(frame("")), mid);
             }
             Screen::Tree(t) => {
                 let location = tilde(&t.location());
@@ -430,14 +425,20 @@ impl App {
                         ListItem::new(Line::from(spans))
                     })
                     .collect();
-                let title = format!(
+                let mut title = format!(
                     " {location} · {} · {} items ",
                     human(node.size),
                     node.children.len()
                 );
+                if node.hidden > 0 {
+                    title += &format!(
+                        "· {} hidden: empty or not removable by you ",
+                        human(node.hidden)
+                    );
+                }
                 let list = List::new(items)
-                    .block(Block::bordered().title(title).fg(Color::Blue))
-                    .highlight_style(Style::new().reversed());
+                    .block(frame(title))
+                    .highlight_style(SELECTED);
                 f.render_stateful_widget(list, main, &mut t.list);
             }
             Screen::Clean(c) => draw_clean(f, main, c),
@@ -490,8 +491,8 @@ fn draw_clean(f: &mut Frame, area: Rect, c: &mut Clean) {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(1)
-        .block(Block::bordered().title(title).fg(Color::Blue))
-        .row_highlight_style(Style::new().reversed());
+        .block(frame(title))
+        .row_highlight_style(SELECTED);
     f.render_stateful_widget(table, list_area, &mut c.table);
 
     let info = match c.table.selected().and_then(|i| c.items.get(i)) {
@@ -507,7 +508,7 @@ fn draw_clean(f: &mut Frame, area: Rect, c: &mut Clean) {
     f.render_widget(
         Paragraph::new(info)
             .wrap(Wrap { trim: true })
-            .block(Block::bordered().fg(Color::DarkGray)),
+            .block(Block::bordered().border_style(Color::DarkGray)),
         detail,
     );
 
@@ -557,7 +558,12 @@ fn draw_clean(f: &mut Frame, area: Rect, c: &mut Clean) {
         .areas(popup);
     f.render_widget(Clear, popup);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title).fg(rgb(ORANGE))),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(title)
+                .border_style(rgb(ORANGE))
+                .title_style(rgb(ORANGE)),
+        ),
         popup,
     );
 }
@@ -587,6 +593,19 @@ fn tilde(p: &Path) -> String {
             .to_string(),
         _ => p.display().to_string(),
     }
+}
+
+/// A background instead of `reversed`: reversing swaps the colors of every span, which blanks the usage bar.
+const SELECTED: Style = Style::new()
+    .bg(Color::Rgb(50, 56, 66))
+    .add_modifier(Modifier::BOLD);
+
+/// Colors only the border and title; a styled Block would tint every cell inside it.
+fn frame<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+    Block::bordered()
+        .title(title)
+        .border_style(Color::Blue)
+        .title_style(Color::Blue)
 }
 
 fn rgb((r, g, b): (u8, u8, u8)) -> Color {
