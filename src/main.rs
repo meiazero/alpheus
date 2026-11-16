@@ -25,6 +25,7 @@ Output modes:
 Options:
   --mount PATH  filesystem shown in the bar text (default: /)
   -h, --help    print this help
+  -V, --version print the version
 
 TUI:
   tui           disk list; Enter scans the selected mount
@@ -93,6 +94,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     .filter(|&s| s > 0)
                     .ok_or("--watch needs a positive number of seconds")?;
                 watch = Some(secs);
+            }
+            "-V" | "--version" => {
+                println!("alpheus {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
             }
             "-h" | "--help" => {
                 print!("{HELP}");
