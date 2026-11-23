@@ -882,4 +882,108 @@ mod tests {
             .map(|i| tree.root.children[i].name.as_str());
         assert_eq!(selected, Some("other"));
     }
+
+    #[test]
+    fn cleanup_prunes_only_successful_removals_from_the_retained_explorer() {
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            // Runs during unwind too, so a failed assertion leaves nothing behind.
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp = TempDir(std::env::temp_dir().join(format!("alpheus-tui-{}", std::process::id())));
+        let dir = tmp.0.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in ["__pycache__", ".pytest_cache", ".mypy_cache"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            std::fs::write(dir.join(name).join("data"), vec![1u8; 8192]).unwrap();
+        }
+        let root = scan::scan(&dir, &AtomicU64::new(0));
+        let sizes = |root: &Node| -> Vec<(String, u64)> {
+            let mut v: Vec<_> = root
+                .children
+                .iter()
+                .map(|n| (n.name.clone(), n.size))
+                .collect();
+            v.sort();
+            v
+        };
+        let before = sizes(&root);
+        let removed = before.iter().find(|(n, _)| n == "__pycache__").unwrap().1;
+        let total = root.size;
+        let mut items = clean::find(&dir, &AtomicU64::new(0));
+        assert_eq!(items.len(), 3);
+        for c in &mut items {
+            // Reclaimable bytes can differ from tree bytes (hard links); the tree must use its own.
+            if c.path.ends_with("__pycache__") {
+                c.size = 1;
+            }
+            // A tool command that succeeds but leaves the directory must not be pruned.
+            if c.path.ends_with(".mypy_cache") {
+                c.action = Action::Run(&["/usr/bin/true"]);
+            }
+        }
+        let mut app = App {
+            disks: vec![],
+            table: TableState::default(),
+            screen: Screen::Tree(Tree {
+                root,
+                path: vec![],
+                parents_sel: vec![],
+                list: ListState::default().with_selected(Some(2)),
+                snapshot: false,
+            }),
+            explorer: None,
+        };
+        app.on_key(KeyCode::Char('c'));
+        finish_with(&mut app, Some(Done::Clean(items)));
+        // Swap a scanned candidate for a symlink after the scan: execution refuses it.
+        std::fs::rename(dir.join(".pytest_cache"), dir.join("kept")).unwrap();
+        std::os::unix::fs::symlink(dir.join("kept"), dir.join(".pytest_cache")).unwrap();
+        let Screen::Clean(clean) = &mut app.screen else {
+            panic!("expected the cleanup screen");
+        };
+        clean.marked.fill(true);
+        clean.table.select(Some(2));
+
+        app.execute_cleanup(true);
+
+        assert!(!dir.join("__pycache__").exists());
+        assert!(dir.join("kept/data").exists());
+        assert!(dir.join(".mypy_cache/data").exists());
+        let Screen::Clean(clean) = &app.screen else {
+            panic!("expected the cleanup screen");
+        };
+        assert_eq!(
+            clean.items.len(),
+            1,
+            "only the refused candidate stays listed"
+        );
+        assert_eq!(
+            clean.table.selected(),
+            Some(0),
+            "selection clamped to the rows left"
+        );
+        app.on_key(KeyCode::Esc);
+        let Screen::Tree(tree) = &app.screen else {
+            panic!("expected the retained explorer");
+        };
+        assert!(tree.snapshot);
+        assert_eq!(tree.root.size, total - removed);
+        let kept: Vec<_> = before
+            .into_iter()
+            .filter(|(n, _)| n != "__pycache__")
+            .collect();
+        assert_eq!(
+            sizes(&tree.root),
+            kept,
+            "failed and tool-command rows keep their sizes"
+        );
+        assert!(
+            tree.list
+                .selected()
+                .is_some_and(|i| i < tree.root.children.len())
+        );
+    }
 }
