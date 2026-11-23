@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/meiazero/alpheus/compare/v0.2.0...v0.3.0) (2026-11-23)
+
+
+### Added
+
+* **desktop:** show what fills the home folder, live as it is measured ([6c4fb4c](https://github.com/meiazero/alpheus/commit/6c4fb4ce9d4e427a3c920dfbfee636132caaa695))
+
 ## [0.2.0](https://github.com/meiazero/alpheus/compare/v0.1.2...v0.2.0) (2026-11-23)
 
 
