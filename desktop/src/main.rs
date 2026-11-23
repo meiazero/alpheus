@@ -6,19 +6,30 @@ mod disks;
 use disks::Disk;
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, KeyBinding, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, relative,
-    rgb, size,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
 const BG: u32 = 0x000000;
 const TEXT: u32 = 0xe6e6e6;
 const MUTED: u32 = 0x8c8c8c;
-const FAINT: u32 = 0x4f4f4f;
+const EMPTY_DOT: u32 = 0x262626;
 const GREEN: u32 = 0x4ade80;
 const AMBER: u32 = 0xfbbf24;
 const RED: u32 = 0xf87171;
 const DOTS: usize = 48;
+const METER_ROWS: usize = 3;
+const DOT: f32 = 6.0;
+const DOT_GAP: f32 = 3.0;
+const METER_W: f32 = DOTS as f32 * (DOT + DOT_GAP) - DOT_GAP;
+const METER_H: f32 = METER_ROWS as f32 * (DOT + DOT_GAP) - DOT_GAP;
 const FONT_SIZE: f32 = 14.0;
+const LINE: f32 = FONT_SIZE * 1.5;
+const PAD: f32 = 24.0;
+const IN_BLOCK: f32 = 6.0;
+const BETWEEN_BLOCKS: f32 = 24.0;
+const BLOCK_H: f32 = 2.0 * LINE + METER_H + 2.0 * IN_BLOCK;
+/// Past this many disks the list scrolls instead of growing the window.
+const MAX_VISIBLE: usize = 6;
 
 actions!(alpheus_desktop, [Quit]);
 
@@ -44,11 +55,11 @@ impl Render for DiskListView {
             .text_color(rgb(TEXT))
             .font_family(self.font.clone())
             .text_size(px(FONT_SIZE))
-            .line_height(relative(1.5))
-            .p_6()
+            .line_height(px(LINE))
+            .p(px(PAD))
             .flex()
             .flex_col()
-            .gap_5()
+            .gap(px(BETWEEN_BLOCKS))
             .child(
                 div()
                     .flex()
@@ -62,7 +73,7 @@ impl Render for DiskListView {
                     .id("disk-list")
                     .flex()
                     .flex_col()
-                    .gap_5()
+                    .gap(px(BETWEEN_BLOCKS))
                     .flex_1()
                     .overflow_y_scroll()
                     .children(self.disks.iter().map(render_disk)),
@@ -72,51 +83,79 @@ impl Render for DiskListView {
 
 fn render_disk(disk: &Disk) -> impl IntoElement {
     let pct = disk.pct();
-    let filled = dot_count(pct);
-    let empty = DOTS - filled;
-    let bar_color = level_color(pct);
+    let color = level_color(pct);
 
     div()
+        .w(px(METER_W))
         .flex()
         .flex_col()
-        .gap_1()
+        .gap(px(IN_BLOCK))
         .child(
             div()
                 .flex()
                 .flex_row()
-                .gap_2()
+                .justify_between()
+                .gap_4()
                 .child(
                     div()
-                        .font_weight(FontWeight::BOLD)
-                        .child(disk.mount.clone()),
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .min_w(px(0.0))
+                                .truncate()
+                                .child(disk.mount.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(rgb(MUTED))
+                                .child(disk.fstype.clone()),
+                        ),
                 )
-                .child(div().text_color(rgb(MUTED)).child(disk.fstype.clone())),
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(color))
+                        .child(format!("{pct:.0}%")),
+                ),
         )
+        .child(meter(dot_count(pct), color))
         .child(
             div()
                 .flex()
                 .flex_row()
-                .flex_wrap()
                 .child(human_si(disk.used))
                 .child(div().text_color(rgb(MUTED)).child(" used of "))
                 .child(human_si(disk.total))
                 .child(div().text_color(rgb(MUTED)).child(" · "))
                 .child(human_si(disk.avail))
-                .child(div().text_color(rgb(MUTED)).child(" free · "))
-                .child(format!("{pct:.0}%"))
-                .child(div().text_color(rgb(MUTED)).child(" full")),
+                .child(div().text_color(rgb(MUTED)).child(" free")),
         )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .when(filled > 0, |el| {
-                    el.child(div().text_color(rgb(bar_color)).child("•".repeat(filled)))
-                })
-                .when(empty > 0, |el| {
-                    el.child(div().text_color(rgb(FAINT)).child("•".repeat(empty)))
-                }),
-        )
+}
+
+/// A grid of dots filled column by column, like the fix-storage disk meter.
+fn meter(filled: usize, color: u32) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(DOT_GAP))
+        .children((0..DOTS).map(move |i| {
+            let c = if i < filled { color } else { EMPTY_DOT };
+            div().flex().flex_col().gap(px(DOT_GAP)).children(
+                (0..METER_ROWS).map(move |_| div().size(px(DOT)).rounded_full().bg(rgb(c))),
+            )
+        }))
+}
+
+/// Fits the window to its content so short disk lists leave no empty space below.
+fn window_height(disks: usize) -> f32 {
+    let n = disks.clamp(1, MAX_VISIBLE) as f32;
+    2.0 * PAD + LINE + BETWEEN_BLOCKS + n * BLOCK_H + (n - 1.0) * BETWEEN_BLOCKS
 }
 
 /// Linux's CosmicTextSystem matches exact fontdb family names, not fontconfig aliases like "monospace".
@@ -191,7 +230,11 @@ fn main() {
         .detach();
 
         let font = pick_mono_font(cx);
-        let bounds = Bounds::centered(None, size(px(560.0), px(420.0)), cx);
+        let bounds = Bounds::centered(
+            None,
+            size(px(METER_W + 2.0 * PAD), px(window_height(disks.len()))),
+            cx,
+        );
 
         cx.open_window(
             WindowOptions {
@@ -243,5 +286,14 @@ mod tests {
         assert_eq!(level_color(75.0), AMBER);
         assert_eq!(level_color(90.0), AMBER);
         assert_eq!(level_color(90.1), RED);
+
+        // One disk: padding, header line, header gap, and one block of two lines, meter and gaps.
+        assert_eq!(
+            window_height(1),
+            2.0 * 24.0 + 21.0 + 24.0 + (2.0 * 21.0 + 24.0 + 2.0 * 6.0)
+        );
+        assert_eq!(window_height(0), window_height(1));
+        assert_eq!(window_height(40), window_height(MAX_VISIBLE));
+        assert!(window_height(3) > window_height(2));
     }
 }
