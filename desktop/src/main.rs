@@ -12,7 +12,12 @@ use gpui::{
     WindowOptions, actions, div, prelude::*, px, rgb, size, uniform_list,
 };
 use scan::Node;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -60,24 +65,135 @@ const SWEEP_ROWS: usize = 3;
 
 actions!(alpheus_desktop, [Quit, Up, Down, Open, Back]);
 
-enum Explorer {
-    Scanning {
-        files: Arc<AtomicU64>,
-        started: Instant,
-    },
-    Ready(Tree),
-}
-
-struct Tree {
+/// The home folder as measured so far. Each top-level entry is scanned on its own and lands when done,
+/// so the root re-sorts while the user browses. Top-level entries are therefore known by an id (names
+/// can collide after lossy UTF-8 conversion); deeper levels never change and are known by index.
+struct Explorer {
     root: Node,
-    /// Child indices from the root to the open folder.
+    /// The id of each of `root.children`, in the same order.
+    root_ids: Vec<usize>,
+    /// Top-level entries still being measured, in name order.
+    pending: Vec<(usize, String)>,
+    total: usize,
+    files: Arc<AtomicU64>,
+    started: Instant,
+    /// How long the whole scan took, once every entry has landed.
+    took: Option<Duration>,
+    /// From the root to the open folder: a top-level id, then child indices.
     path: Vec<usize>,
     selected: usize,
+    /// Set once the user moves the selection; until then it stays on the biggest entry.
+    picked: bool,
 }
 
-impl Tree {
+enum Entry<'a> {
+    Done(usize, &'a Node),
+    Pending(usize, &'a str),
+}
+
+impl Entry<'_> {
+    /// The id at the root, the child index below it.
+    fn key(&self) -> usize {
+        match self {
+            Entry::Done(key, _) | Entry::Pending(key, _) => *key,
+        }
+    }
+}
+
+impl Explorer {
+    /// `own_size` is the home folder's own blocks, which no child accounts for.
+    fn new(pending: Vec<(usize, String)>, own_size: u64) -> Self {
+        Explorer {
+            root: Node {
+                name: String::new(),
+                size: own_size,
+                is_dir: true,
+                children: vec![],
+                hidden: 0,
+            },
+            root_ids: vec![],
+            total: pending.len(),
+            took: pending.is_empty().then_some(Duration::ZERO),
+            pending,
+            files: Arc::default(),
+            started: Instant::now(),
+            path: vec![],
+            selected: 0,
+            picked: false,
+        }
+    }
+
+    /// The folders from the root's child down to the open one.
+    fn trail(&self) -> Vec<&Node> {
+        let mut trail = vec![];
+        let Some((&id, rest)) = self.path.split_first() else {
+            return trail;
+        };
+        let Some(pos) = self.root_ids.iter().position(|&i| i == id) else {
+            return trail;
+        };
+        let mut node = &self.root.children[pos];
+        trail.push(node);
+        for &ix in rest {
+            match node.children.get(ix) {
+                Some(child) => node = child,
+                None => break,
+            }
+            trail.push(node);
+        }
+        trail
+    }
+
     fn current(&self) -> &Node {
-        self.path.iter().fold(&self.root, |n, &i| &n.children[i])
+        self.trail().last().copied().unwrap_or(&self.root)
+    }
+
+    /// Measured entries biggest first; at the root, the ones still being measured follow.
+    fn entries(&self) -> Vec<Entry<'_>> {
+        if !self.path.is_empty() {
+            let node = self.current();
+            return node
+                .children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| Entry::Done(i, c))
+                .collect();
+        }
+        let done = self.root_ids.iter().zip(&self.root.children);
+        let mut list: Vec<Entry> = done.map(|(&id, c)| Entry::Done(id, c)).collect();
+        list.extend(self.pending.iter().map(|(id, n)| Entry::Pending(*id, n)));
+        list
+    }
+
+    /// Adds a measured top-level entry. It is listed under the same rule as `scan::walk` uses for
+    /// children: removable from the home folder itself, or holding something removable inside.
+    /// The entry the user picked stays selected as the root re-sorts.
+    fn land(&mut self, id: usize, node: Node, removable: bool) {
+        let keep = self
+            .entries()
+            .get(self.selected)
+            .filter(|_| self.picked)
+            .map(|e| e.key());
+        self.pending.retain(|(i, _)| *i != id);
+        self.root.size += node.size;
+        if node.size > 0 && (removable || !node.children.is_empty()) {
+            let at = self.root.children.partition_point(|c| c.size >= node.size);
+            self.root.children.insert(at, node);
+            self.root_ids.insert(at, id);
+        } else {
+            self.root.hidden += node.size;
+        }
+        if self.pending.is_empty() {
+            self.took = Some(self.started.elapsed());
+        }
+        // An entry that landed hidden drops out of the list, which can leave the selection past the end.
+        self.selected = self.selected.min(self.entries().len().saturating_sub(1));
+        if self.path.is_empty()
+            && let Some(key) = keep
+            && let Some(ix) = self.entries().iter().position(|e| e.key() == key)
+        {
+            self.selected = ix;
+        }
     }
 }
 
@@ -92,35 +208,91 @@ struct DiskListView {
 }
 
 impl DiskListView {
+    /// Measures each top-level entry of the home folder on its own, a few at a time, so results arrive
+    /// as they finish and the scan uses several cores without filling gpui's background pool.
+    /// ponytail: a hard link shared by two top-level folders counts in both; one shared `seen` set would need scan.rs changes.
     fn start_scan(&mut self, cx: &mut Context<Self>) {
-        let files = Arc::new(AtomicU64::new(0));
-        self.explorer = Explorer::Scanning {
-            files: files.clone(),
-            started: Instant::now(),
-        };
-        let home = self.home.clone();
-        let scanned = cx
-            .background_executor()
-            .spawn(async move { scan::scan(&home, &files) });
-        cx.spawn(async move |this, cx| {
-            let root = scanned.await;
-            this.update(cx, |view, cx| {
-                view.explorer = Explorer::Ready(Tree {
-                    root,
-                    path: vec![],
-                    selected: 0,
-                });
-                cx.notify();
+        let meta = std::fs::symlink_metadata(&self.home).ok();
+        let dev = meta.as_ref().map(|m| m.dev());
+        // Same rule as scan::walk: unlinking needs write and search on the parent, and a sticky one
+        // only lets owners remove their own entries.
+        let writable = std::ffi::CString::new(self.home.as_os_str().as_bytes())
+            .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0);
+        let sticky = meta.as_ref().is_some_and(|m| m.mode() & 0o1000 != 0);
+        let uid = unsafe { libc::getuid() };
+        let mut entries: Vec<(String, PathBuf, bool)> = std::fs::read_dir(&self.home)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                // DirEntry::metadata does not follow symlinks; another filesystem mounted inside home is skipped, like `du -x`.
+                let m = e.metadata().ok().filter(|m| Some(m.dev()) == dev)?;
+                let removable = writable && (!sticky || m.uid() == uid);
+                Some((
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.path(),
+                    removable,
+                ))
             })
-        })
-        .detach();
-        // Repaints the sweep and the counter until the scan lands.
+            .collect();
+        entries.sort();
+        let own_size = meta.map_or(0, |m| m.blocks() * 512);
+        let pending = entries
+            .iter()
+            .enumerate()
+            .map(|(id, (name, ..))| (id, name.clone()));
+        self.explorer = Explorer::new(pending.collect(), own_size);
+        let queue: Rc<RefCell<VecDeque<(usize, PathBuf, bool)>>> = Rc::new(RefCell::new(
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(id, (_, path, removable))| (id, path, removable))
+                .collect(),
+        ));
+        // ponytail: half the cores, 2 to 8; disks rather than CPUs set the real limit.
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        for _ in 0..workers {
+            let queue = queue.clone();
+            let files = self.explorer.files.clone();
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let next = queue.borrow_mut().pop_front();
+                    let Some((id, path, removable)) = next else {
+                        break;
+                    };
+                    let files = files.clone();
+                    let scanned = cx
+                        .background_executor()
+                        .spawn(async move { scan::scan(&path, &files) })
+                        .await;
+                    let landed = this.update(cx, |view, cx| {
+                        let name = view
+                            .explorer
+                            .pending
+                            .iter()
+                            .find(|(i, _)| *i == id)
+                            .map(|(_, n)| n.clone());
+                        let node = Node {
+                            name: name.unwrap_or_default(),
+                            ..scanned
+                        };
+                        view.explorer.land(id, node, removable);
+                        cx.notify();
+                    });
+                    if landed.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        // Repaints the progress meter and the counter until the last entry lands.
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(SWEEP_FRAME).await;
                 let scanning = this.update(cx, |view, cx| {
                     cx.notify();
-                    matches!(view.explorer, Explorer::Scanning { .. })
+                    view.explorer.took.is_none()
                 });
                 if !matches!(scanning, Ok(true)) {
                     break;
@@ -130,101 +302,67 @@ impl DiskListView {
         .detach();
     }
 
-    fn tree(&mut self) -> Option<&mut Tree> {
-        match &mut self.explorer {
-            Explorer::Ready(tree) => Some(tree),
-            Explorer::Scanning { .. } => None,
-        }
+    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.explorer.picked = true;
+        let last = self.explorer.entries().len().saturating_sub(1);
+        self.explorer.selected = ix.min(last);
+        self.scroll
+            .scroll_to_item(self.explorer.selected, ScrollStrategy::Center);
+        cx.notify();
     }
 
-    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(tree) = self.tree() {
-            let last = tree.current().children.len().saturating_sub(1);
-            tree.selected = ix.min(last);
-            let selected = tree.selected;
-            self.scroll.scroll_to_item(selected, ScrollStrategy::Center);
+    fn open(&mut self, cx: &mut Context<Self>) {
+        let target = match self.explorer.entries().get(self.explorer.selected) {
+            Some(Entry::Done(key, node)) if node.is_dir && !node.children.is_empty() => Some(*key),
+            _ => None,
+        };
+        if let Some(key) = target {
+            self.explorer.path.push(key);
+            self.explorer.selected = 0;
+            self.scroll.scroll_to_item(0, ScrollStrategy::Top);
             cx.notify();
         }
     }
 
-    fn open(&mut self, cx: &mut Context<Self>) {
-        if let Some(tree) = self.tree() {
-            let ix = tree.selected;
-            let opens = tree
-                .current()
-                .children
-                .get(ix)
-                .is_some_and(|c| c.is_dir && !c.children.is_empty());
-            if opens {
-                tree.path.push(ix);
-                tree.selected = 0;
-                self.scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            }
-        }
-    }
-
     fn back(&mut self, cx: &mut Context<Self>) {
-        if let Some(tree) = self.tree()
-            && let Some(ix) = tree.path.pop()
-        {
-            tree.selected = ix;
+        if let Some(key) = self.explorer.path.pop() {
+            let ix = self
+                .explorer
+                .entries()
+                .iter()
+                .position(|e| e.key() == key)
+                .unwrap_or(0);
+            self.explorer.selected = ix;
             self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
             cx.notify();
         }
     }
 
     fn render_explorer(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let tree = match &self.explorer {
-            Explorer::Scanning { files, started } => {
-                let elapsed = started.elapsed();
-                return div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap(px(IN_BLOCK))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(format!("Measuring {}", tilde(&self.home, &self.home))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(MUTED))
-                                    .child("finding what takes the space in your home folder"),
-                            ),
-                    )
-                    .child(sweep(columns(width), elapsed))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .child(thousands(files.load(Ordering::Relaxed)))
-                            .child(div().text_color(rgb(MUTED)).child(" items checked · "))
-                            .child(clock(elapsed)),
-                    )
-                    .child(
-                        div()
-                            .text_color(rgb(FAINT))
-                            .child("Folders appear here when the scan finishes."),
-                    )
-                    .into_any_element();
-            }
-            Explorer::Ready(tree) => tree,
-        };
-        let node = tree.current();
+        let ex = &self.explorer;
+        let node = ex.current();
         let mut location = self.home.clone();
-        let mut walk = &tree.root;
-        for &i in &tree.path {
-            walk = &walk.children[i];
-            location.push(&walk.name);
+        for folder in ex.trail() {
+            location.push(&folder.name);
         }
-        let count = node.children.len();
+        let count = ex.entries().len();
+        let done = ex.total - ex.pending.len();
+        let items = thousands(ex.files.load(Ordering::Relaxed));
+        let summary = match (ex.path.is_empty(), ex.took) {
+            (true, None) => format!(
+                "measuring {done} of {} · {items} items · {}",
+                ex.total,
+                clock(ex.started.elapsed())
+            ),
+            (true, Some(took)) => format!(
+                "{} · {count} items · measured in {}",
+                human_si(node.size),
+                clock(took)
+            ),
+            (false, _) => format!("{} · {count} items", human_si(node.size)),
+        };
+        let cols = columns(width);
+        let filled = (cols * done).checked_div(ex.total).unwrap_or(cols);
 
         div()
             .flex_1()
@@ -247,11 +385,7 @@ impl DiskListView {
                                     .font_weight(FontWeight::BOLD)
                                     .child(tilde(&location, &self.home)),
                             )
-                            .child(
-                                div()
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("{} · {count} items", human_si(node.size))),
-                            ),
+                            .child(div().text_color(rgb(MUTED)).child(summary)),
                     )
                     .child(
                         div()
@@ -266,6 +400,14 @@ impl DiskListView {
                             .child(" back"),
                     ),
             )
+            // The meter slot stays after the scan so the list does not jump up when it ends.
+            .child(
+                div()
+                    .h(px(meter_len(SWEEP_ROWS)))
+                    .when(ex.took.is_none(), |el| {
+                        el.child(progress(cols, filled, ex.started.elapsed()))
+                    }),
+            )
             .when(count == 0, |el| {
                 el.child(
                     div()
@@ -278,23 +420,28 @@ impl DiskListView {
                     "entries",
                     count,
                     cx.processor(move |view, range: std::ops::Range<usize>, _window, cx| {
-                        let Explorer::Ready(tree) = &view.explorer else {
-                            return vec![];
-                        };
-                        let node = tree.current();
+                        let ex = &view.explorer;
+                        let entries = ex.entries();
+                        let parent = ex.current().size;
                         range
-                            .map(|ix| {
-                                let child = &node.children[ix];
-                                render_entry(child, node.size, ix == tree.selected, width)
-                                    .id(ix)
-                                    .on_click(cx.listener(
-                                        move |view, event: &ClickEvent, _, cx| {
-                                            view.select(ix, cx);
-                                            if event.click_count() >= 2 {
-                                                view.open(cx);
-                                            }
-                                        },
-                                    ))
+                            .filter_map(|ix| {
+                                let selected = ix == ex.selected;
+                                let row = match entries.get(ix)? {
+                                    Entry::Done(_, child) => {
+                                        render_entry(child, parent, selected, width)
+                                    }
+                                    Entry::Pending(_, name) => {
+                                        render_pending(name, selected, width)
+                                    }
+                                };
+                                Some(row.id(ix).on_click(cx.listener(
+                                    move |view, event: &ClickEvent, _, cx| {
+                                        view.select(ix, cx);
+                                        if event.click_count() >= 2 {
+                                            view.open(cx);
+                                        }
+                                    },
+                                )))
                             })
                             .collect()
                     }),
@@ -302,7 +449,6 @@ impl DiskListView {
                 .track_scroll(self.scroll.clone())
                 .flex_1(),
             )
-            .into_any_element()
     }
 }
 
@@ -320,14 +466,12 @@ impl Render for DiskListView {
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|view, _: &Up, _, cx| {
-                if let Some(ix) = view.tree().map(|t| t.selected) {
-                    view.select(ix.saturating_sub(1), cx);
-                }
+                let ix = view.explorer.selected.saturating_sub(1);
+                view.select(ix, cx);
             }))
             .on_action(cx.listener(|view, _: &Down, _, cx| {
-                if let Some(ix) = view.tree().map(|t| t.selected) {
-                    view.select(ix + 1, cx);
-                }
+                let ix = view.explorer.selected + 1;
+                view.select(ix, cx);
             }))
             .on_action(cx.listener(|view, _: &Open, _, cx| view.open(cx)))
             .on_action(cx.listener(|view, _: &Back, _, cx| view.back(cx)))
@@ -521,6 +665,54 @@ fn render_entry(child: &Node, parent: u64, selected: bool, width: f32) -> gpui::
         )
 }
 
+/// A top-level entry still being measured: same slots as a measured one, so nothing moves when it lands.
+fn render_pending(name: &str, selected: bool, width: f32) -> gpui::Div {
+    let room =
+        (width - 2.0 * CHAR_W - SIZE_W - meter_len(ROW_DOTS) - PCT_W - 3.0 * COL_GAP) / CHAR_W;
+    div()
+        .w_full()
+        .py(px(ROW_PAD))
+        .px(px(CHAR_W))
+        .flex()
+        .flex_col()
+        .whitespace_nowrap()
+        .text_color(rgb(MUTED))
+        .when(selected, |el| el.bg(rgb(SELECTED_BG)))
+        .when(!selected, |el| el.hover(|s| s.bg(rgb(HOVER_BG))))
+        .child(
+            div()
+                .h(px(LINE))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(COL_GAP))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_row()
+                        .child(div().w(px(2.0 * CHAR_W)).flex_none().child(if selected {
+                            "›"
+                        } else {
+                            ""
+                        }))
+                        .child(fit_path(name, room as usize)),
+                )
+                .child(
+                    div()
+                        .w(px(SIZE_W))
+                        .flex_none()
+                        .text_right()
+                        .text_color(rgb(FAINT))
+                        .child("measuring"),
+                )
+                .child(meter(0, CALM, ROW_DOTS, 1))
+                .child(div().w(px(PCT_W)).flex_none()),
+        )
+        .child(div().h(px(LINE)))
+}
+
 /// Follows the biggest child down while it holds at least half of its parent, like fix-storage's "mostly in".
 fn culprit(node: &Node) -> Vec<&Node> {
     let mut chain = vec![];
@@ -566,17 +758,21 @@ fn columns(width: f32) -> usize {
     ((width + DOT_GAP) / (DOT + DOT_GAP)).max(1.0) as usize
 }
 
-/// The loading meter: a bright head moves left to right with a fading tail, then wraps around.
-fn sweep(cols: usize, elapsed: Duration) -> impl IntoElement {
-    let lap = (cols + SWEEP_TAIL) as u128;
-    let head = (elapsed.as_millis() / SWEEP_MS_PER_COL % lap) as usize;
+/// The scan meter: columns before `filled` are done; over the rest a bright head sweeps with a fading tail.
+fn progress(cols: usize, filled: usize, elapsed: Duration) -> impl IntoElement {
+    let lap = (cols.saturating_sub(filled) + SWEEP_TAIL) as u128;
+    let head = filled + (elapsed.as_millis() / SWEEP_MS_PER_COL % lap) as usize;
     div()
         .flex_none()
         .flex()
         .flex_row()
         .gap(px(DOT_GAP))
         .children((0..cols).map(move |i| {
-            let c = sweep_shade(head, i);
+            let c = if i < filled {
+                CALM
+            } else {
+                sweep_shade(head, i)
+            };
             div().flex().flex_col().gap(px(DOT_GAP)).children(
                 (0..SWEEP_ROWS).map(move |_| div().size(px(DOT)).rounded_full().bg(rgb(c))),
             )
@@ -761,10 +957,7 @@ fn main() {
                     let mut view = DiskListView {
                         disks,
                         home: PathBuf::from(home),
-                        explorer: Explorer::Scanning {
-                            files: Arc::default(),
-                            started: Instant::now(),
-                        },
+                        explorer: Explorer::new(vec![], 0),
                         scroll: UniformListScrollHandle::new(),
                         font,
                         focus_handle,
@@ -850,6 +1043,58 @@ mod tests {
         );
         assert_eq!(sweep_shade(40, 10), EMPTY_DOT, "past the tail stays empty");
         assert!(sweep_shade(10, 5) & 0xff < TEXT & 0xff);
+    }
+
+    #[test]
+    fn landing_entries_sort_live_and_keep_the_selection() {
+        let leaf = |size: u64| Node {
+            name: String::new(),
+            size,
+            is_dir: false,
+            children: vec![],
+            hidden: 0,
+        };
+        // Ids 0 and 1 share a name, as two non-UTF-8 names can after lossy conversion.
+        let names = ["a", "a", "c", "d"].iter().enumerate();
+        let mut ex = Explorer::new(names.map(|(i, n)| (i, n.to_string())).collect(), 4);
+        let keys = |ex: &Explorer| -> Vec<usize> { ex.entries().iter().map(|e| e.key()).collect() };
+        assert_eq!(keys(&ex), [0, 1, 2, 3]);
+        ex.land(1, leaf(10), true);
+        assert_eq!(
+            keys(&ex),
+            [1, 0, 2, 3],
+            "the twin named alike is still pending"
+        );
+        assert_eq!(ex.selected, 0, "an untouched selection stays on top");
+        ex.land(2, leaf(50), true);
+        assert_eq!(keys(&ex), [2, 1, 0, 3]);
+        assert_eq!(ex.selected, 0, "still on top after a bigger entry lands");
+        ex.selected = 1; // the user picks id 1
+        ex.picked = true;
+        ex.land(3, leaf(20), true);
+        assert_eq!(
+            ex.entries()[ex.selected].key(),
+            1,
+            "a picked entry follows its id"
+        );
+        assert!(ex.took.is_none());
+        ex.land(0, leaf(7), false);
+        assert_eq!(
+            keys(&ex),
+            [2, 3, 1],
+            "an entry the user cannot remove is hidden"
+        );
+        assert!(ex.took.is_some());
+        assert_eq!(
+            ex.root.size,
+            4 + 10 + 50 + 20 + 7,
+            "own blocks plus every entry"
+        );
+        assert_eq!(ex.root.hidden, 7);
+        assert!(
+            Explorer::new(vec![], 0).took.is_some(),
+            "an empty home is done at once"
+        );
     }
 
     #[test]
