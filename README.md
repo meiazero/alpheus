@@ -43,6 +43,16 @@ alpheus clean            # regenerable files under ~; space marks, enter reviews
 
 `alpheus --help` lists every flag.
 
+In the explorer, `c` scans the current directory for cleanup candidates. `Esc` from cleanup
+returns to the same explorer, including its selection and scroll position, without scanning
+the disk again. Cancelling the cleanup scan also returns there; `r` explicitly rescans only
+the cleanup root. When started with `alpheus clean`, `Esc` still returns to the disk list.
+
+Successful directory removals update the retained tree and ancestor sizes in memory. After
+cleanup, the explorer is labelled a snapshot: tool commands may leave cache contents, trash
+may remain on the same disk, and hard-link accounting or external changes may be stale.
+Disk usage is refreshed from filesystem statistics rather than inferred from removed rows.
+
 ## Waybar
 
 ```json
