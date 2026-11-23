@@ -1,0 +1,14 @@
+[package]
+name = "alpheus-desktop"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Own workspace and lockfile: gpui's dependency pins below must not reach the static musl CLI build.
+[workspace]
+
+[dependencies]
+gpui = "0.2.2"
+# gpui 0.2.2 pulls xattr 0.2.3, which uses `libc::ENOATTR`, removed on Linux in libc 0.2.190.
+libc = ">=0.2.189, <0.2.190"
