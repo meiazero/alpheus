@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/meiazero/alpheus/compare/v0.1.1...v0.1.2) (2026-11-23)
+
+
+### Fixed
+
+* **tui:** return to retained explorer without rescanning ([6038992](https://github.com/meiazero/alpheus/commit/6038992dcb7aaf7b9b19aad8bc9483b0df06e625))
+* **tui:** return to the explorer without rescanning the disk ([3b535c4](https://github.com/meiazero/alpheus/commit/3b535c4dbd573746a91a26f6cffd4faf91a06c6c))
+
 ## [0.1.1](https://github.com/meiazero/alpheus/compare/v0.1.0...v0.1.1) (2026-11-16)
 
 
