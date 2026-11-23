@@ -32,6 +32,17 @@ curl -fsSL https://raw.githubusercontent.com/meiazero/alpheus/main/install.sh | 
 `ALPHEUS_VERSION=v0.1.0` pins a release and `ALPHEUS_INSTALL_DIR` changes the target directory.
 From source: `cargo install --git https://github.com/meiazero/alpheus`.
 
+The desktop window is a preview, released as `alpheus-desktop-x86_64-unknown-linux-gnu.tar.xz`
+next to the CLI. It needs glibc 2.35 or newer, `libxkbcommon-x11`, and a Vulkan driver:
+
+```bash
+curl -fsSLO https://github.com/meiazero/alpheus/releases/latest/download/alpheus-desktop-x86_64-unknown-linux-gnu.tar.xz
+curl -fsSLO https://github.com/meiazero/alpheus/releases/latest/download/sha256.sum
+grep ' alpheus-desktop-' sha256.sum | sha256sum --check -
+tar -xJf alpheus-desktop-x86_64-unknown-linux-gnu.tar.xz
+./alpheus-desktop-x86_64-unknown-linux-gnu/alpheus-desktop
+```
+
 ## Quick start
 
 ```bash
@@ -77,5 +88,8 @@ cargo test
 
 - `rust-toolchain.toml` pins the toolchain; rustup installs it on the first `cargo` call.
 - CI runs the commands above, a release build, and `bashka --check` on `install.sh`.
+- `desktop/` is its own crate with its own lockfile. CI runs the same three commands inside it;
+  locally they need `libxkbcommon-x11-dev` and `libwayland-dev`.
 - Releases: merging the release-please PR tags the version, and `release.yml` builds the static
-  musl binary with cargo-dist, attests it, and publishes it with `sha256.sum`.
+  musl binary with cargo-dist and the glibc desktop binary on ubuntu-22.04, attests both, and
+  publishes them with `sha256.sum`.
