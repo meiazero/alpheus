@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/meiazero/alpheus/compare/v0.1.2...v0.2.0) (2026-11-23)
+
+
+### Added
+
+* **desktop:** add a GPUI window that lists disks in the fix-storage style ([31257fe](https://github.com/meiazero/alpheus/commit/31257fecc831bcba0aef4d627a678944468beb58))
+* **desktop:** add a gpui window that lists mounted disks ([ee4391a](https://github.com/meiazero/alpheus/commit/ee4391a7365ec3aa92be36f08e9e4ae04fd6f473))
+* **desktop:** draw the disk meter as a dot grid and fit the window to its disks ([7e1b2d9](https://github.com/meiazero/alpheus/commit/7e1b2d9247ed64ec5e2694c0b5b186bafd09251f))
+* **desktop:** lead with the home disk and open at 720p ([1b26551](https://github.com/meiazero/alpheus/commit/1b26551ad549c5972b3811191e5f58edd56c2fc1))
+* **desktop:** make the disk meter the first thing you see ([566088e](https://github.com/meiazero/alpheus/commit/566088e5dcbfad8965bb82f34842d8e79df054bf))
+* **desktop:** open at 720p with the home disk first and the rest as cards ([5f20d46](https://github.com/meiazero/alpheus/commit/5f20d46873b74974c431e63e9c6c852bd7e3a772))
+
 ## [0.1.2](https://github.com/meiazero/alpheus/compare/v0.1.1...v0.1.2) (2026-11-23)
 
 
