@@ -235,6 +235,48 @@ jobs:
             ${{ env.BUILD_MANIFEST_NAME }}
           if-no-files-found: error
 
+  # The desktop window links gpui, which needs glibc and X11/Wayland libraries, so it cannot be the
+  # static musl build dist makes. It is built here from its own crate (desktop/) and shipped next to it.
+  # ubuntu-22.04 keeps the glibc floor at 2.35 so the binary runs on older distributions too.
+  build-desktop:
+    name: build-desktop (x86_64-unknown-linux-gnu)
+    needs:
+      - plan
+    if: ${{ needs.plan.outputs.publishing == 'true' || inputs.tag == 'dry-run' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      ARCHIVE: alpheus-desktop-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install gpui build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-x11-dev libwayland-dev
+      # rustup on the runner reads rust-toolchain.toml; no cache, so a PR run cannot poison a release build.
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Test
+        run: cargo test --locked --manifest-path desktop/Cargo.toml
+      - name: Build
+        run: cargo build --release --locked --manifest-path desktop/Cargo.toml
+      # Same layout as dist's archive: one top-level folder with the binary, README and LICENSE.
+      - name: Package
+        run: |
+          mkdir -p "$ARCHIVE" artifacts
+          cp desktop/target/release/alpheus-desktop README.md LICENSE "$ARCHIVE/"
+          strip "$ARCHIVE/alpheus-desktop"
+          tar -cJf "artifacts/$ARCHIVE.tar.xz" "$ARCHIVE"
+      # The artifacts-build-local- prefix puts the archive in attest's subject list and in host's upload.
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: artifacts-build-local-desktop
+          path: artifacts/${{ env.ARCHIVE }}.tar.xz
+          if-no-files-found: error
+
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     name: build-global-artifacts
@@ -295,6 +337,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
+      - build-desktop
     if: ${{ needs.plan.outputs.publishing == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -323,9 +366,10 @@ jobs:
       - test
       - build-local-artifacts
       - build-global-artifacts
+      - build-desktop
       - attest
-    # Only run if we're "publishing", the tests and attestation passed, and local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.test.result == 'success' && needs.attest.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # Only run if we're "publishing", the tests, the desktop build and attestation passed, and local and global didn't fail (skipped is fine)
+    if: ${{ always() && needs.plan.result == 'success' && needs.test.result == 'success' && needs.build-desktop.result == 'success' && needs.attest.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
