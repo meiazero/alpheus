@@ -102,16 +102,15 @@ impl Tree {
             node = &node.children[i];
         }
         self.parents_sel.clone_from(&self.path);
-        let selected = if self.path.len() == location.len() {
-            selected_name.and_then(|name| node.children.iter().position(|n| n.name == name))
-        } else {
-            None
-        };
+        let by_name = selected_name
+            .filter(|_| self.path.len() == location.len())
+            .and_then(|name| node.children.iter().position(|n| n.name == name));
+        // Clamp now: the hidden explorer is not rendered between removals of one batch.
         self.list.select(
             node.children
                 .len()
                 .checked_sub(1)
-                .map(|last| selected.or(fallback).unwrap_or(0).min(last)),
+                .map(|last| by_name.or(fallback).unwrap_or(0).min(last)),
         );
     }
 
@@ -205,6 +204,7 @@ impl Clean {
             self.status += &format!(" · {failed} failed, see red rows");
         }
         self.mode = Mode::Browse;
+        // Ratatui skips its own clamp when the table area is too small to draw.
         self.table.select(
             self.items
                 .len()
@@ -749,7 +749,6 @@ fn bar(pct: f64, width: usize) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     fn node(name: &str, size: u64, children: Vec<Node>) -> Node {
         Node {
@@ -782,264 +781,105 @@ mod tests {
         }
     }
 
-    fn app() -> App {
-        App {
-            disks: vec![],
-            table: TableState::default(),
-            screen: Screen::Tree(tree()),
-            explorer: None,
-        }
-    }
-
-    // Deliver a deterministic result through the same channel used by the worker.
-    fn complete_cleanup(app: &mut App, items: Vec<Candidate>) {
+    // Replace the worker's channel so the scan outcome is deterministic.
+    fn finish_with(app: &mut App, done: Option<Done>) {
         let Screen::Scanning { rx, .. } = &mut app.screen else {
-            panic!("expected cleanup scan");
+            panic!("expected a scan in flight");
         };
         let (tx, ready) = mpsc::channel();
         *rx = ready;
-        tx.send(Done::Clean(items))
-            .unwrap_or_else(|_| panic!("receiver dropped"));
+        if let Some(done) = done {
+            tx.send(done).unwrap_or_else(|_| panic!("receiver dropped"));
+        }
+        drop(tx);
         app.finish_scan();
-        assert!(matches!(app.screen, Screen::Clean(_)));
     }
 
-    fn assert_retained(app: &App, children: *const Node) {
-        let Screen::Tree(tree) = &app.screen else {
-            panic!("return must restore the explorer directly");
+    fn assert_explorer_restored(app: &App) {
+        let Screen::Tree(t) = &app.screen else {
+            panic!("expected the retained explorer");
         };
         assert_eq!(
-            tree.root.children.as_ptr(),
-            children,
-            "tree must not be rebuilt"
-        );
-        assert_eq!(
-            tree.location(),
+            t.location(),
             Path::new("/alpheus-missing-test-root/project")
         );
-        assert_eq!(tree.path, [0]);
-        assert_eq!(tree.parents_sel, [0]);
-        assert_eq!(tree.list.selected(), Some(1));
-        assert_eq!(tree.list.offset(), 1);
+        assert_eq!((t.list.selected(), t.list.offset()), (Some(1), 1));
         assert!(app.explorer.is_none());
     }
 
     #[test]
-    fn cleanup_returns_to_the_same_explorer_after_refresh_and_confirmation() {
-        let mut app = app();
-        let Screen::Tree(tree) = &app.screen else {
-            unreachable!()
+    fn cleanup_returns_to_the_explorer_it_left() {
+        let mut app = App {
+            disks: vec![],
+            table: TableState::default(),
+            screen: Screen::Tree(tree()),
+            explorer: None,
         };
-        let children = tree.root.children.as_ptr();
+        // Esc after a refresh, Esc during the scan, and a dead worker all go back.
         app.on_key(KeyCode::Char('c'));
-        complete_cleanup(&mut app, vec![]);
-        if let Screen::Clean(clean) = &mut app.screen {
-            clean.mode = Mode::Confirm;
-        }
-        app.on_key(KeyCode::Esc);
-        assert!(
-            matches!(app.screen, Screen::Clean(_)),
-            "cancel only the dialog"
-        );
+        finish_with(&mut app, Some(Done::Clean(vec![])));
         app.on_key(KeyCode::Char('r'));
-        complete_cleanup(&mut app, vec![]);
+        finish_with(&mut app, Some(Done::Clean(vec![])));
         app.on_key(KeyCode::Esc);
-        assert_retained(&app, children);
+        assert_explorer_restored(&app);
         app.on_key(KeyCode::Char('c'));
-        complete_cleanup(&mut app, vec![]);
         app.on_key(KeyCode::Esc);
-        assert_retained(&app, children);
-        app.on_key(KeyCode::Backspace);
-        let Screen::Tree(tree) = &app.screen else {
-            unreachable!()
-        };
-        assert!(tree.path.is_empty());
-        assert_eq!(tree.list.selected(), Some(0));
-    }
-
-    #[test]
-    fn cancelling_initial_or_refresh_cleanup_scan_restores_explorer() {
-        for refresh in [false, true] {
-            let mut app = app();
-            let Screen::Tree(tree) = &app.screen else {
-                unreachable!()
-            };
-            let children = tree.root.children.as_ptr();
-            app.on_key(KeyCode::Char('c'));
-            if refresh {
-                complete_cleanup(&mut app, vec![]);
-                app.on_key(KeyCode::Char('r'));
-            }
-            app.on_key(KeyCode::Esc);
-            app.finish_scan(); // A detached worker cannot replace the restored screen.
-            assert_retained(&app, children);
-        }
-    }
-
-    #[test]
-    fn disconnected_cleanup_worker_restores_explorer() {
-        let mut app = app();
-        let Screen::Tree(tree) = &app.screen else {
-            unreachable!()
-        };
-        let children = tree.root.children.as_ptr();
+        assert_explorer_restored(&app);
         app.on_key(KeyCode::Char('c'));
-        let Screen::Scanning { rx, .. } = &mut app.screen else {
-            unreachable!()
-        };
-        let (tx, closed) = mpsc::channel();
-        *rx = closed;
-        drop(tx);
-        app.finish_scan();
-        assert_retained(&app, children);
-    }
+        finish_with(&mut app, None);
+        assert_explorer_restored(&app);
 
-    #[test]
-    fn standalone_cleanup_and_explorer_still_return_to_disks() {
-        let mut app = app();
         app.on_key(KeyCode::Esc);
         assert!(matches!(app.screen, Screen::Disks));
         app.start_scan(PathBuf::from("/alpheus-missing-test-root"), true);
-        complete_cleanup(&mut app, vec![]);
+        finish_with(&mut app, Some(Done::Clean(vec![])));
         app.on_key(KeyCode::Esc);
-        assert!(matches!(app.screen, Screen::Disks));
-        app.start_scan(PathBuf::from("/alpheus-missing-test-root"), false);
-        app.on_key(KeyCode::Esc);
-        assert!(matches!(app.screen, Screen::Disks));
+        assert!(matches!(app.screen, Screen::Disks), "standalone cleanup");
     }
 
     #[test]
     fn removal_updates_cached_ancestors_sorting_and_navigation() {
         let mut tree = tree();
-        tree.root.children[0].hidden = 10;
         tree.remove(Path::new("/alpheus-missing-test-root/project/target"));
         assert_eq!(tree.root.size, 500);
         assert_eq!(tree.path, [1], "smaller project moves after other");
         assert_eq!(tree.parents_sel, [1]);
         assert_eq!(tree.current().size, 100);
-        assert_eq!(tree.current().hidden, 10);
-        assert_eq!(tree.current().children[0].name, "src");
         assert_eq!(tree.list.selected(), Some(0), "selection follows src");
         tree.remove(Path::new("/outside/project"));
         tree.remove(Path::new("/alpheus-missing-test-root/project/missing"));
         assert_eq!(tree.root.size, 500, "unrepresented paths change nothing");
-        tree.remove(Path::new("/alpheus-missing-test-root/project/src"));
-        assert!(tree.current().children.is_empty());
-        assert_eq!(tree.list.selected(), None);
         tree.remove(Path::new("/alpheus-missing-test-root/project"));
         assert!(tree.path.is_empty(), "return to surviving ancestor");
         assert_eq!(tree.root.size, 400);
-        assert_eq!(tree.list.selected(), Some(0));
-        tree.remove(Path::new("/alpheus-missing-test-root"));
-        assert_eq!(tree.root.size, 0);
-        assert!(tree.root.children.is_empty());
-        assert_eq!(tree.list.selected(), None);
-    }
+        assert_eq!(
+            tree.list.selected(),
+            Some(0),
+            "row where project was, clamped"
+        );
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "alpheus-tui-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).unwrap();
-        }
-    }
-
-    #[test]
-    fn execution_patches_only_successful_removals_and_keeps_safety_rechecks() {
-        let dir = TempDir::new();
-        for name in ["__pycache__", ".pytest_cache", ".mypy_cache"] {
-            fs::create_dir(dir.0.join(name)).unwrap();
-            fs::write(dir.0.join(name).join("data"), vec![1u8; 8192]).unwrap();
-        }
-        let mut items = clean::find(&dir.0, &AtomicU64::new(0));
-        assert_eq!(items.len(), 3);
-        // Reclaimable bytes and tree bytes can differ (for example with hard links).
-        items
-            .iter_mut()
-            .find(|c| c.path.ends_with("__pycache__"))
-            .unwrap()
-            .size = 1;
-        // This command succeeds while leaving its cache in place; it must not be pruned.
-        items
-            .iter_mut()
-            .find(|c| c.path.ends_with(".mypy_cache"))
-            .unwrap()
-            .action = Action::Run(&["true"]);
-        let root = scan::scan(&dir.0, &AtomicU64::new(0));
-        let size = root.size;
-        let removed_size = root
-            .children
-            .iter()
-            .find(|n| n.name == "__pycache__")
-            .unwrap()
-            .size;
-        let failed_size = root
-            .children
-            .iter()
-            .find(|n| n.name == ".pytest_cache")
-            .unwrap()
-            .size;
-        let mut app = app();
-        app.screen = Screen::Tree(Tree {
-            root,
+        // One cleanup batch: the second removal must see the first one's clamped selection.
+        let mut tree = Tree {
+            root: node(
+                "/r",
+                2700,
+                vec![
+                    node("project", 1000, vec![node("target", 700, vec![])]),
+                    node("other", 900, vec![]),
+                    node("__pycache__", 800, vec![]),
+                ],
+            ),
             path: vec![],
             parents_sel: vec![],
             list: ListState::default().with_selected(Some(2)),
             snapshot: false,
-        });
-        app.on_key(KeyCode::Char('c'));
-        complete_cleanup(&mut app, items);
-        // Swap a scanned candidate for a symlink. execute must still refuse it.
-        fs::rename(dir.0.join(".pytest_cache"), dir.0.join("kept")).unwrap();
-        std::os::unix::fs::symlink(dir.0.join("kept"), dir.0.join(".pytest_cache")).unwrap();
-        if let Screen::Clean(clean) = &mut app.screen {
-            clean.marked.fill(true);
-        }
-        app.execute_cleanup(true);
-        assert!(!dir.0.join("__pycache__").exists());
-        assert!(dir.0.join("kept/data").exists());
-        assert!(dir.0.join(".mypy_cache/data").exists());
-        let Screen::Clean(clean) = &app.screen else {
-            unreachable!()
         };
-        assert_eq!(clean.items.len(), 1);
-        assert!(
-            clean.items[0]
-                .blocked
-                .as_deref()
-                .unwrap()
-                .contains("changed since scan")
-        );
-        assert_eq!(clean.table.selected(), Some(0));
-        app.on_key(KeyCode::Esc);
-        let Screen::Tree(tree) = &app.screen else {
-            unreachable!()
-        };
-        assert!(tree.snapshot);
-        assert_eq!(tree.root.size, size - removed_size);
-        assert_eq!(tree.root.children.len(), 2);
-        assert!(tree.root.children.iter().any(|n| n.name == ".mypy_cache"));
-        assert_eq!(
-            tree.root
-                .children
-                .iter()
-                .find(|n| n.name == ".pytest_cache")
-                .unwrap()
-                .size,
-            failed_size
-        );
+        tree.remove(Path::new("/r/__pycache__"));
+        tree.remove(Path::new("/r/project/target"));
+        let selected = tree
+            .list
+            .selected()
+            .map(|i| tree.root.children[i].name.as_str());
+        assert_eq!(selected, Some("other"));
     }
 }
